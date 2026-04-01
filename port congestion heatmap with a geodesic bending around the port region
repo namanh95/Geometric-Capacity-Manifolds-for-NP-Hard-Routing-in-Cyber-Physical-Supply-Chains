@@ -1,0 +1,193 @@
+# ============================================================
+# Port congestion heatmap + geodesic bending figure
+# Colab-ready script
+# ============================================================
+
+import numpy as np
+import matplotlib.pyplot as plt
+from heapq import heappush, heappop
+
+# -----------------------------
+# Global settings
+# -----------------------------
+np.random.seed(42)
+SAVE_FIG = True
+FIG_DPI = 300
+OUTFILE = "port_congestion_geodesic.png"
+
+# -----------------------------
+# Domain and parameters
+# -----------------------------
+grid_n = 300
+x = np.linspace(0, 1, grid_n)
+y = np.linspace(0, 1, grid_n)
+X, Y = np.meshgrid(x, y, indexing="xy")
+
+# Stylized port location
+x_port = np.array([0.32, 0.52])
+
+# Source and destination
+x_source = np.array([0.08, 0.78])
+x_target = np.array([0.88, 0.26])
+
+# Congestion parameters
+alpha = 5.0      # congestion intensity
+sigma = 0.12     # congestion spread
+
+# -----------------------------
+# Metric field
+# g(x) = a(x) I
+# -----------------------------
+a = 1.0 + alpha * np.exp(-((X - x_port[0])**2 + (Y - x_port[1])**2) / (sigma**2))
+
+# Optional: add mild background anisotropy / corridor effect
+# Keeps the image visually richer while still clean
+corridor = 0.25 * np.exp(-((Y - 0.45)**2) / (0.18**2))
+a = a + corridor
+
+# -----------------------------
+# Build weighted grid graph
+# -----------------------------
+def build_grid_graph(a, x, y, connectivity=8):
+    ny, nxg = a.shape
+    neighbors4 = [(1,0),(-1,0),(0,1),(0,-1)]
+    neighbors8 = neighbors4 + [(1,1),(1,-1),(-1,1),(-1,-1)]
+    neighbors = neighbors8 if connectivity == 8 else neighbors4
+
+    dx = x[1] - x[0]
+    dy = y[1] - y[0]
+
+    graph = {}
+    for iy in range(ny):
+        for ix in range(nxg):
+            u = (iy, ix)
+            graph[u] = []
+            for dix, diy in neighbors:
+                jx = ix + dix
+                jy = iy + diy
+                if 0 <= jx < nxg and 0 <= jy < ny:
+                    step = np.sqrt((dix * dx)**2 + (diy * dy)**2)
+                    weight = 0.5 * (np.sqrt(a[iy, ix]) + np.sqrt(a[jy, jx])) * step
+                    graph[u].append(((jy, jx), weight))
+    return graph
+
+def nearest_grid_point(pt, x, y):
+    ix = int(np.argmin(np.abs(x - pt[0])))
+    iy = int(np.argmin(np.abs(y - pt[1])))
+    return (iy, ix)
+
+def dijkstra_grid(graph, start, goal):
+    pq = []
+    heappush(pq, (0.0, start))
+    dist = {start: 0.0}
+    prev = {}
+    visited = set()
+
+    while pq:
+        cur_d, u = heappop(pq)
+        if u in visited:
+            continue
+        visited.add(u)
+
+        if u == goal:
+            break
+
+        for v, w in graph[u]:
+            nd = cur_d + w
+            if v not in dist or nd < dist[v]:
+                dist[v] = nd
+                prev[v] = u
+                heappush(pq, (nd, v))
+
+    if goal not in dist:
+        return None, np.inf
+
+    path = []
+    cur = goal
+    while cur != start:
+        path.append(cur)
+        cur = prev[cur]
+    path.append(start)
+    path.reverse()
+    return path, dist[goal]
+
+def grid_path_to_coords(path, x, y):
+    return np.array([[x[ix], y[iy]] for (iy, ix) in path])
+
+# -----------------------------
+# Compute geodesic approximation
+# -----------------------------
+graph = build_grid_graph(a, x, y, connectivity=8)
+start = nearest_grid_point(x_source, x, y)
+goal = nearest_grid_point(x_target, x, y)
+
+path_idx, path_cost = dijkstra_grid(graph, start, goal)
+geo_coords = grid_path_to_coords(path_idx, x, y)
+
+# Straight line reference
+straight_coords = np.vstack([x_source, x_target])
+
+# -----------------------------
+# Plot
+# -----------------------------
+plt.figure(figsize=(8, 6.5))
+
+# Heatmap / contour field
+cf = plt.contourf(X, Y, a, levels=35, cmap="viridis")
+cbar = plt.colorbar(cf)
+cbar.set_label(r"Congestion metric factor $a(x)$ in $g(x)=a(x)I$", fontsize=13)
+
+# Plot port congestion center
+plt.scatter(
+    [x_port[0]], [x_port[1]],
+    s=220, marker="X", color="red", edgecolor="black", linewidth=0.8,
+    label="Port congestion center", zorder=5
+)
+
+# Plot source and target
+plt.scatter(
+    [x_source[0]], [x_source[1]],
+    s=180, marker="o", color="orange", edgecolor="black", linewidth=0.8,
+    label="Source", zorder=6
+)
+plt.scatter(
+    [x_target[0]], [x_target[1]],
+    s=180, marker="s", color="limegreen", edgecolor="black", linewidth=0.8,
+    label="Destination", zorder=6
+)
+
+# Plot straight line route
+plt.plot(
+    straight_coords[:, 0], straight_coords[:, 1],
+    linestyle="--", linewidth=2.5, color="white",
+    label="Euclidean reference path", zorder=4
+)
+
+# Plot geodesic
+plt.plot(
+    geo_coords[:, 0], geo_coords[:, 1],
+    linewidth=3.2, color="deepskyblue",
+    label="Congestion-aware geodesic", zorder=7
+)
+
+# Optional: stylized coastline / port boundary
+coast_x = [0.0, 0.18, 0.22, 0.18, 0.0]
+coast_y = [0.0, 0.0, 0.18, 0.38, 0.38]
+plt.fill(coast_x, coast_y, color="lightgray", alpha=0.45, zorder=2)
+plt.text(0.035, 0.08, "Port zone", fontsize=12, color="black")
+
+plt.xlim(0, 1)
+plt.ylim(0, 1)
+plt.xlabel("x", fontsize=14)
+plt.ylabel("y", fontsize=14)
+plt.title("Port Congestion Heatmap and Geodesic Bending", fontsize=18, pad=12)
+plt.legend(loc="upper right", fontsize=11, framealpha=0.95)
+plt.tight_layout()
+
+if SAVE_FIG:
+    plt.savefig(OUTFILE, dpi=FIG_DPI, bbox_inches="tight")
+
+plt.show()
+
+print(f"Saved figure as: {OUTFILE}")
+print(f"Geodesic cost: {path_cost:.4f}")
