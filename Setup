@@ -1,0 +1,440 @@
+# ============================================================
+# Geometric Capacity Manifolds for NP-Hard Routing
+# Numerical Illustration / Figure Generator
+# Colab-ready script
+# ============================================================
+
+import numpy as np
+import matplotlib.pyplot as plt
+import networkx as nx
+from scipy.spatial import KDTree
+from scipy.interpolate import RegularGridInterpolator
+from scipy.ndimage import gaussian_filter
+from heapq import heappush, heappop
+
+# -----------------------------
+# Global settings
+# -----------------------------
+np.random.seed(42)
+
+SAVE_FIGS = True
+FIG_DPI = 300
+OUTDIR = "."
+
+# -----------------------------
+# Utility: save figure
+# -----------------------------
+def savefig(name: str):
+    if SAVE_FIGS:
+        plt.savefig(f"{OUTDIR}/{name}.png", dpi=FIG_DPI, bbox_inches="tight")
+    plt.show()
+
+
+# ============================================================
+# 1. Build a geometric graph
+# ============================================================
+def build_knn_graph(n=25, k=4, noise_scale=0.05):
+    """
+    Create a random geometric graph in the unit square and assign edge costs.
+    Edge cost = Euclidean distance * (1 + small random perturbation).
+    """
+    pts = np.random.rand(n, 2)
+    tree = KDTree(pts)
+    G = nx.Graph()
+
+    for i in range(n):
+        G.add_node(i, pos=pts[i])
+
+    for i in range(n):
+        dists, idxs = tree.query(pts[i], k=k+1)  # includes self
+        for j in idxs[1:]:
+            if i == j:
+                continue
+            pi, pj = pts[i], pts[j]
+            dist = np.linalg.norm(pi - pj)
+            eta = noise_scale * np.random.rand()
+            cost = dist * (1.0 + eta)
+            G.add_edge(i, j, weight=cost)
+
+    return G, pts
+
+
+# ============================================================
+# 2. Congestion / metric field
+# ============================================================
+def build_metric_field(grid_n=200, beta=2.0, sigma=0.12, centers=None):
+    """
+    Build scalar metric factor a(x,y) so metric is g(x)=a(x)I.
+    """
+    x = np.linspace(0, 1, grid_n)
+    y = np.linspace(0, 1, grid_n)
+    X, Y = np.meshgrid(x, y, indexing="xy")
+
+    if centers is None:
+        centers = np.array([
+            [0.30, 0.70],
+            [0.70, 0.65],
+            [0.55, 0.30]
+        ])
+
+    rho = np.zeros_like(X)
+    for cx, cy in centers:
+        rho += np.exp(-((X - cx)**2 + (Y - cy)**2) / (sigma**2))
+
+    a = 1.0 + beta * rho
+    return x, y, X, Y, rho, a, centers
+
+
+def add_localized_shock(a, X, Y, x0=(0.5, 0.5), eps=1.0, sigma=0.10):
+    """
+    Perturbed metric factor:
+        a_tilde(x) = a(x) + eps * exp(-||x-x0||^2/sigma^2)
+    """
+    shock = eps * np.exp(-((X - x0[0])**2 + (Y - x0[1])**2) / (sigma**2))
+    return a + shock, shock
+
+
+# ============================================================
+# 3. Grid shortest path approximation to geodesic
+# ============================================================
+def build_grid_graph(a, x, y, connectivity=8):
+    """
+    Construct a weighted grid graph where moving cost approximates
+    the Riemannian metric length for g(x)=a(x)I.
+    """
+    ny, nxg = a.shape
+    # note: a is shape (len(y), len(x)) because meshgrid indexing="xy"
+    # index convention here: row=i_y, col=i_x
+
+    neighbors4 = [(1,0),(-1,0),(0,1),(0,-1)]
+    neighbors8 = neighbors4 + [(1,1),(1,-1),(-1,1),(-1,-1)]
+    neighbors = neighbors8 if connectivity == 8 else neighbors4
+
+    dx = x[1] - x[0]
+    dy = y[1] - y[0]
+
+    graph = {}
+    for iy in range(ny):
+        for ix in range(nxg):
+            node = (iy, ix)
+            graph[node] = []
+            for dix, diy in neighbors:
+                jx = ix + dix
+                jy = iy + diy
+                if 0 <= jx < nxg and 0 <= jy < ny:
+                    step = np.sqrt((dix * dx)**2 + (diy * dy)**2)
+                    # average local metric factor
+                    weight = 0.5 * (np.sqrt(a[iy, ix]) + np.sqrt(a[jy, jx])) * step
+                    graph[node].append(((jy, jx), weight))
+    return graph
+
+
+def nearest_grid_point(pt, x, y):
+    ix = int(np.argmin(np.abs(x - pt[0])))
+    iy = int(np.argmin(np.abs(y - pt[1])))
+    return (iy, ix)
+
+
+def dijkstra_grid(graph, start, goal):
+    pq = []
+    heappush(pq, (0.0, start))
+    dist = {start: 0.0}
+    prev = {}
+    visited = set()
+
+    while pq:
+        cur_d, u = heappop(pq)
+        if u in visited:
+            continue
+        visited.add(u)
+
+        if u == goal:
+            break
+
+        for v, w in graph[u]:
+            nd = cur_d + w
+            if v not in dist or nd < dist[v]:
+                dist[v] = nd
+                prev[v] = u
+                heappush(pq, (nd, v))
+
+    if goal not in dist:
+        return None, np.inf
+
+    path = []
+    cur = goal
+    while cur != start:
+        path.append(cur)
+        cur = prev[cur]
+    path.append(start)
+    path.reverse()
+    return path, dist[goal]
+
+
+def grid_path_to_coords(path, x, y):
+    coords = np.array([[x[ix], y[iy]] for (iy, ix) in path])
+    return coords
+
+
+# ============================================================
+# 4. Discrete graph shortest path
+# ============================================================
+def shortest_path_graph(G, s, t):
+    path = nx.shortest_path(G, source=s, target=t, weight="weight")
+    cost = nx.shortest_path_length(G, source=s, target=t, weight="weight")
+    return path, cost
+
+
+# ============================================================
+# 5. Plotting helpers
+# ============================================================
+def plot_graph_with_path(G, pts, path=None, title=""):
+    pos = {i: pts[i] for i in range(len(pts))}
+    plt.figure(figsize=(7, 6))
+    nx.draw_networkx_edges(G, pos, alpha=0.45, width=1.2)
+    nx.draw_networkx_nodes(G, pos, node_size=80)
+    nx.draw_networkx_labels(G, pos, font_size=8)
+
+    if path is not None and len(path) >= 2:
+        edges = list(zip(path[:-1], path[1:]))
+        nx.draw_networkx_edges(G, pos, edgelist=edges, width=3)
+
+    plt.xlim(-0.05, 1.05)
+    plt.ylim(-0.05, 1.05)
+    plt.title(title)
+    plt.xlabel("x")
+    plt.ylabel("y")
+    plt.grid(alpha=0.2)
+
+
+def plot_metric_field(X, Y, field, pts=None, path_coords=None, title="", colorbar_label="Metric factor"):
+    plt.figure(figsize=(7, 6))
+    im = plt.contourf(X, Y, field, levels=30)
+    plt.colorbar(im, label=colorbar_label)
+
+    if pts is not None:
+        plt.scatter(pts[:, 0], pts[:, 1], s=25)
+
+    if path_coords is not None:
+        plt.plot(path_coords[:, 0], path_coords[:, 1], linewidth=2.5)
+
+    plt.xlim(0, 1)
+    plt.ylim(0, 1)
+    plt.xlabel("x")
+    plt.ylabel("y")
+    plt.title(title)
+
+
+# ============================================================
+# 6. Main single-run experiment
+# ============================================================
+G, pts = build_knn_graph(n=25, k=4, noise_scale=0.05)
+
+# Choose source/target as far apart nodes
+dmat = np.linalg.norm(pts[:, None, :] - pts[None, :, :], axis=2)
+s, t = np.unravel_index(np.argmax(dmat), dmat.shape)
+
+disc_path, disc_cost = shortest_path_graph(G, s, t)
+
+x, y, X, Y, rho, a, centers = build_metric_field(grid_n=220, beta=2.0, sigma=0.12)
+grid_graph = build_grid_graph(a, x, y, connectivity=8)
+
+start_grid = nearest_grid_point(pts[s], x, y)
+goal_grid = nearest_grid_point(pts[t], x, y)
+
+geo_path_idx, geo_cost = dijkstra_grid(grid_graph, start_grid, goal_grid)
+geo_coords = grid_path_to_coords(geo_path_idx, x, y)
+
+# Shocked metric
+shock_center = (0.50, 0.52)
+eps0 = 0.8
+a_tilde, shock = add_localized_shock(a, X, Y, x0=shock_center, eps=eps0, sigma=0.09)
+grid_graph_tilde = build_grid_graph(a_tilde, x, y, connectivity=8)
+geo_path_idx_tilde, geo_cost_tilde = dijkstra_grid(grid_graph_tilde, start_grid, goal_grid)
+geo_coords_tilde = grid_path_to_coords(geo_path_idx_tilde, x, y)
+
+# ============================================================
+# Figure 1: discrete network + shortest path
+# ============================================================
+plot_graph_with_path(
+    G, pts, disc_path,
+    title="Figure 1. Discrete network and optimal shortest path"
+)
+savefig("figure1_discrete_network_shortest_path")
+
+# ============================================================
+# Figure 2: metric field + geodesic path
+# ============================================================
+plot_metric_field(
+    X, Y, a, pts=pts, path_coords=geo_coords,
+    title="Figure 2. Congestion-induced metric and geodesic path",
+    colorbar_label=r"$a(x)$ in $g(x)=a(x)I$"
+)
+plt.scatter(*pts[s], s=100, marker="o", label="Source")
+plt.scatter(*pts[t], s=100, marker="s", label="Target")
+plt.legend()
+savefig("figure2_metric_field_geodesic")
+
+# ============================================================
+# Figure 3: perturbed metric field with shock
+# ============================================================
+plot_metric_field(
+    X, Y, a_tilde, pts=pts, path_coords=None,
+    title="Figure 3. Perturbed metric after localized shock",
+    colorbar_label=r"$\tilde a(x)$ in $\tilde g(x)=\tilde a(x)I$"
+)
+plt.scatter([shock_center[0]], [shock_center[1]], s=120, marker="x", label="Shock center")
+plt.legend()
+savefig("figure3_perturbed_metric")
+
+# ============================================================
+# Figure 4: nominal vs perturbed geodesics
+# ============================================================
+plt.figure(figsize=(7, 6))
+im = plt.contourf(X, Y, a_tilde, levels=30)
+plt.colorbar(im, label=r"$\tilde a(x)$")
+plt.scatter(pts[:, 0], pts[:, 1], s=25)
+plt.plot(geo_coords[:, 0], geo_coords[:, 1], linewidth=2.5, label="Nominal geodesic")
+plt.plot(geo_coords_tilde[:, 0], geo_coords_tilde[:, 1], linewidth=2.5, linestyle="--", label="Perturbed geodesic")
+plt.scatter(*pts[s], s=100, marker="o", label="Source")
+plt.scatter(*pts[t], s=100, marker="s", label="Target")
+plt.scatter([shock_center[0]], [shock_center[1]], s=120, marker="x", label="Shock center")
+plt.xlim(0, 1)
+plt.ylim(0, 1)
+plt.xlabel("x")
+plt.ylabel("y")
+plt.title("Figure 4. Nominal and perturbed geodesic trajectories")
+plt.legend()
+savefig("figure4_nominal_vs_perturbed_geodesics")
+
+
+# ============================================================
+# 7. Approximation error vs delta
+# ============================================================
+def run_approximation_experiment(node_list=(16, 25, 36, 49, 64), trials=6, k=4):
+    deltas = []
+    errors = []
+
+    for n in node_list:
+        errs_n = []
+        delta_n = 1.0 / np.sqrt(n)
+        for _ in range(trials):
+            G, pts = build_knn_graph(n=n, k=k, noise_scale=0.03)
+            dmat = np.linalg.norm(pts[:, None, :] - pts[None, :, :], axis=2)
+            s, t = np.unravel_index(np.argmax(dmat), dmat.shape)
+
+            try:
+                disc_path, disc_cost = shortest_path_graph(G, s, t)
+            except nx.NetworkXNoPath:
+                continue
+
+            x, y, X, Y, rho, a, centers = build_metric_field(grid_n=180, beta=1.8, sigma=0.12)
+            grid_graph = build_grid_graph(a, x, y, connectivity=8)
+            start_grid = nearest_grid_point(pts[s], x, y)
+            goal_grid = nearest_grid_point(pts[t], x, y)
+            geo_path_idx, geo_cost = dijkstra_grid(grid_graph, start_grid, goal_grid)
+
+            if np.isfinite(geo_cost):
+                errs_n.append(abs(geo_cost - disc_cost))
+
+        if len(errs_n) > 0:
+            deltas.append(delta_n)
+            errors.append(np.mean(errs_n))
+
+    return np.array(deltas), np.array(errors)
+
+
+deltas, errors = run_approximation_experiment()
+
+plt.figure(figsize=(7, 6))
+plt.plot(deltas, errors, marker="o")
+if len(deltas) >= 2:
+    coeff = np.polyfit(deltas, errors, 1)
+    xx = np.linspace(deltas.min(), deltas.max(), 100)
+    yy = np.polyval(coeff, xx)
+    plt.plot(xx, yy, linestyle="--", label=f"Linear fit: slope={coeff[0]:.3f}")
+    plt.legend()
+
+plt.xlabel(r"Node spacing proxy $\delta \approx n^{-1/2}$")
+plt.ylabel(r"Approximation error $|E(\gamma^*) - C(P^*)|$")
+plt.title("Figure 5. Approximation error versus discretization scale")
+plt.grid(alpha=0.3)
+savefig("figure5_error_vs_delta")
+
+
+# ============================================================
+# 8. Trajectory deviation vs epsilon
+# ============================================================
+def resample_polyline(coords, n_points=300):
+    """
+    Resample a polyline to fixed number of points by arc length.
+    """
+    diffs = np.diff(coords, axis=0)
+    seglen = np.sqrt((diffs**2).sum(axis=1))
+    s = np.concatenate([[0], np.cumsum(seglen)])
+    total = s[-1]
+    if total == 0:
+        return np.repeat(coords[:1], n_points, axis=0)
+
+    s_new = np.linspace(0, total, n_points)
+    out = np.zeros((n_points, 2))
+    out[:, 0] = np.interp(s_new, s, coords[:, 0])
+    out[:, 1] = np.interp(s_new, s, coords[:, 1])
+    return out
+
+
+def path_deviation(c1, c2):
+    r1 = resample_polyline(c1, 300)
+    r2 = resample_polyline(c2, 300)
+    d = np.sqrt(((r1 - r2)**2).sum(axis=1))
+    return np.max(d)
+
+
+eps_values = np.linspace(0.1, 1.0, 8)
+deviations = []
+
+for eps in eps_values:
+    a_eps, _ = add_localized_shock(a, X, Y, x0=shock_center, eps=eps, sigma=0.09)
+    gg = build_grid_graph(a_eps, x, y, connectivity=8)
+    p_idx, cst = dijkstra_grid(gg, start_grid, goal_grid)
+    coords_eps = grid_path_to_coords(p_idx, x, y)
+    deviations.append(path_deviation(geo_coords, coords_eps))
+
+deviations = np.array(deviations)
+
+plt.figure(figsize=(7, 6))
+plt.plot(eps_values, deviations, marker="o")
+if len(eps_values) >= 2:
+    coeff = np.polyfit(eps_values, deviations, 1)
+    xx = np.linspace(eps_values.min(), eps_values.max(), 100)
+    yy = np.polyval(coeff, xx)
+    plt.plot(xx, yy, linestyle="--", label=f"Linear fit: slope={coeff[0]:.3f}")
+    plt.legend()
+
+plt.xlabel(r"Shock magnitude $\varepsilon$")
+plt.ylabel(r"Trajectory deviation $D$")
+plt.title("Figure 6. Geodesic deviation versus shock magnitude")
+plt.grid(alpha=0.3)
+savefig("figure6_deviation_vs_epsilon")
+
+
+# ============================================================
+# 9. Print summary numbers
+# ============================================================
+print("================================================")
+print("Summary")
+print("================================================")
+print(f"Source node: {s}")
+print(f"Target node: {t}")
+print(f"Discrete shortest-path cost: {disc_cost:.4f}")
+print(f"Nominal geodesic grid cost: {geo_cost:.4f}")
+print(f"Perturbed geodesic grid cost: {geo_cost_tilde:.4f}")
+print(f"Single-run approximation gap: {abs(geo_cost - disc_cost):.4f}")
+print(f"Single-run trajectory deviation: {path_deviation(geo_coords, geo_coords_tilde):.4f}")
+print("Saved figures:")
+print(" - figure1_discrete_network_shortest_path.png")
+print(" - figure2_metric_field_geodesic.png")
+print(" - figure3_perturbed_metric.png")
+print(" - figure4_nominal_vs_perturbed_geodesics.png")
+print(" - figure5_error_vs_delta.png")
+print(" - figure6_deviation_vs_epsilon.png")
